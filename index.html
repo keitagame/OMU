@@ -198,6 +198,573 @@
         else this.SR &= ~0x80;
     }
 }
+class PPU {
+    constructor(bus) {
+        this.bus = bus;
+
+        // スキャンライン / Hカウンタ
+        this.scanline = 0;   // 0〜261
+        this.hcounter = 0;   // 0〜340
+
+        // レジスタ
+        this.ctrl = 0;
+        this.mask = 0;
+        this.status = 0;
+
+        this.vramAddr = 0;
+        this.vramInc = 1;
+
+        this.oamAddr = 0;
+        this.cgAddr = 0;
+
+        // スクロール
+        this.bgScroll = [
+            { x: 0, y: 0 },
+            { x: 0, y: 0 },
+            { x: 0, y: 0 },
+            { x: 0, y: 0 }
+        ];
+
+        // BGベースアドレス
+        this.bgBase = [0, 0, 0, 0];
+
+        // フレームバッファ（256×240）
+        this.framebuffer = new Uint32Array(256 * 240);
+    }
+
+    // -----------------------------
+    // レジスタ読み書き
+    // -----------------------------
+    read(addr) {
+        switch (addr) {
+            case 0x031002: // PPUSTAT
+                return this.status;
+            case 0x031030: // SCANLINE
+                return this.scanline;
+            case 0x031032: // HCOUNTER
+                return this.hcounter;
+            case 0x03103A: // CGDATA (読み)
+                return this.readCGRAM();
+        }
+        return 0xFF;
+    }
+
+    write(addr, value) {
+        value &= 0xFF;
+
+        switch (addr) {
+            case 0x031000: this.ctrl = value; break;
+            case 0x031001: this.mask = value; break;
+
+            case 0x031004: // VRAMADDR low
+                this.vramAddr = (this.vramAddr & 0xFF00) | value;
+                break;
+            case 0x031005: // VRAMADDR high
+                this.vramAddr = (this.vramAddr & 0x00FF) | (value << 8);
+                break;
+
+            case 0x031008: this.vramInc = value; break;
+
+            case 0x03100A: this.oamAddr = value; break;
+            case 0x03100C: this.writeOAM(value); break;
+
+            case 0x031010: this.bgScroll[0].x = value; break;
+            case 0x031012: this.bgScroll[0].y = value; break;
+            case 0x031014: this.bgScroll[1].x = value; break;
+            case 0x031016: this.bgScroll[1].y = value; break;
+            case 0x031018: this.bgScroll[2].x = value; break;
+            case 0x03101A: this.bgScroll[2].y = value; break;
+            case 0x03101C: this.bgScroll[3].x = value; break;
+            case 0x03101E: this.bgScroll[3].y = value; break;
+
+            case 0x031020: this.bgBase[0] = value; break;
+            case 0x031022: this.bgBase[1] = value; break;
+            case 0x031024: this.bgBase[2] = value; break;
+            case 0x031026: this.bgBase[3] = value; break;
+
+            case 0x031034: this.writeINIDISP(value); break;
+
+            case 0x031038: this.cgAddr = value; break;
+            case 0x03103A: this.writeCGRAM(value); break;
+        }
+    }
+
+    // -----------------------------
+    // VRAM / OAM / CGRAM アクセス
+    // -----------------------------
+    readVRAM() {
+        const v = this.bus.vram[this.vramAddr];
+        this.vramAddr = (this.vramAddr + this.vramInc) & 0xFFFF;
+        return v;
+    }
+
+    writeVRAM(value) {
+        this.bus.vram[this.vramAddr] = value;
+        this.vramAddr = (this.vramAddr + this.vramInc) & 0xFFFF;
+    }
+
+    writeOAM(value) {
+        const addr = this.oamAddr & 0x3FF;
+        this.bus.oam[addr] = value;
+        this.oamAddr = (this.oamAddr + 1) & 0x3FF;
+    }
+
+    writeCGRAM(value) {
+        const addr = this.cgAddr & 0x1FF;
+        this.bus.cgram[addr] = value;
+        this.cgAddr = (this.cgAddr + 1) & 0x1FF;
+    }
+
+    readCGRAM() {
+        const addr = this.cgAddr & 0x1FF;
+        const v = this.bus.cgram[addr];
+        this.cgAddr = (this.cgAddr + 1) & 0x1FF;
+        return v;
+    }
+
+    // -----------------------------
+    // スキャンライン進行
+    // -----------------------------
+    step() {
+        this.hcounter++;
+
+        if (this.hcounter >= 341) {
+            this.hcounter = 0;
+            this.scanline++;
+
+            if (this.scanline === 240) {
+                this.status |= 0x80; // VBlank
+            }
+
+            if (this.scanline >= 262) {
+                this.scanline = 0;
+                this.status &= ~0x80; // VBlank解除
+                this.renderFrame();
+            }
+        }
+    }
+
+    // -----------------------------
+    // フレーム描画（最小）
+    // -----------------------------
+    renderFrame() {
+        // とりあえず背景色だけ塗る
+        const bgColor = this.readBGColor();
+        this.framebuffer.fill(bgColor);
+    }
+
+    readBGColor() {
+        const lo = this.bus.cgram[0];
+        const hi = this.bus.cgram[1];
+        const color = (hi << 8) | lo;
+        return this.convertBGR15toRGBA(color);
+    }
+
+    convertBGR15toRGBA(c) {
+        const r = (c & 0x1F) << 3;
+        const g = ((c >> 5) & 0x1F) << 3;
+        const b = ((c >> 10) & 0x1F) << 3;
+        return (255 << 24) | (b << 16) | (g << 8) | r;
+    }
+
+    // -----------------------------
+    // Canvas へ描画
+    // -----------------------------
+    render(ctx) {
+        const img = ctx.createImageData(256, 240);
+        const buf = new Uint32Array(img.data.buffer);
+        buf.set(this.framebuffer);
+        ctx.putImageData(img, 0, 0);
+    }
+}
+class FMChannel {
+    constructor() {
+        this.keyOn = false;
+        this.freq = 0;
+        this.alg = 0;
+        this.operators = [
+            new FMOperator(),
+            new FMOperator(),
+            new FMOperator(),
+            new FMOperator()
+        ];
+    }
+
+    writeKey(value) {
+        this.keyOn = !!(value & 0x80);
+    }
+
+    writeFreq(value) {
+        this.freq = value; // 仮
+    }
+
+    writeAlg(value) {
+        this.alg = value & 0x07;
+    }
+
+    write(offset, value) {
+        // FM0OP0〜OP3 の設定が来る
+        const opIndex = Math.floor(offset / 4);
+        if (opIndex < 4) {
+            this.operators[opIndex].write(offset % 4, value);
+        }
+    }
+
+    step() {
+        // まだ音を生成しない
+    }
+
+    outputL() { return 0; }
+    outputR() { return 0; }
+}
+class FMOperator {
+    constructor() {
+        this.mul = 1;
+        this.tl = 0;
+        this.ar = 0;
+        this.dr = 0;
+        this.sl = 0;
+        this.rr = 0;
+    }
+
+    write(offset, value) {
+        // 後で実装
+    }
+
+    step() {
+        // 後で実装
+    }
+
+    output() {
+        return 0;
+    }
+}
+class PCMChannel {
+    constructor(bus) {
+        this.bus = bus;
+
+        this.addr = 0;     // サンプルアドレス (24bit)
+        this.length = 0;   // サンプル長
+        this.freq = 0;     // 再生周波数
+        this.control = 0;  // 再生/ループ/ADPCM/音量
+        this.position = 0; // 現在の再生位置
+        this.playing = false;
+    }
+
+    write(offset, value) {
+        switch (offset) {
+            case 0: // ADDR low
+                this.addr = (this.addr & 0xFFFF00) | value;
+                break;
+            case 1: // ADDR mid
+                this.addr = (this.addr & 0xFF00FF) | (value << 8);
+                break;
+            case 2: // ADDR high
+                this.addr = (this.addr & 0x00FFFF) | (value << 16);
+                break;
+
+            case 3: // LEN low
+                this.length = (this.length & 0xFF00) | value;
+                break;
+            case 4: // LEN high
+                this.length = (this.length & 0x00FF) | (value << 8);
+                break;
+
+            case 5: // FREQ
+                this.freq = value;
+                break;
+
+            case 6: // CTL
+                this.control = value;
+                this.playing = !!(value & 0x80);
+                break;
+
+            case 7: // unused / volume high?
+                break;
+        }
+    }
+
+    step() {
+        if (!this.playing) return;
+
+        // まだ音を生成しない（後で実装）
+        this.position++;
+
+        if (this.position >= this.length) {
+            if (this.control & 0x40) {
+                // ループ
+                this.position = 0;
+            } else {
+                this.playing = false;
+            }
+        }
+    }
+
+    outputL() { return 0; }
+    outputR() { return 0; }
+}
+class PSGSquare {
+    constructor() {
+        this.period = 0;
+        this.volume = 0;
+        this.duty = 0;
+        this.phase = 0;
+    }
+
+    write(offset, value) {
+        switch (offset) {
+            case 0: this.period = (this.period & 0xFF00) | value; break;
+            case 1: this.period = (this.period & 0x00FF) | ((value & 0x0F) << 8); break;
+            case 2: this.volume = value; break;
+            case 3: this.duty = value & 0x03; break;
+        }
+    }
+
+    step() {
+        this.phase++;
+    }
+
+    outputL() { return 0; }
+    outputR() { return 0; }
+}
+class PSGNoise {
+    constructor() {
+        this.volume = 0;
+        this.lfsr = 0xACE1; // 初期値
+    }
+
+    write(offset, value) {
+        if (offset === 2) this.volume = value;
+    }
+
+    step() {
+        // LFSR 更新（後で実装）
+        const bit = ((this.lfsr >> 15) ^ (this.lfsr >> 14)) & 1;
+        this.lfsr = ((this.lfsr << 1) | bit) & 0xFFFF;
+    }
+
+    outputL() { return 0; }
+    outputR() { return 0; }
+}
+
+class APU {
+    constructor(bus) {
+        this.bus = bus;
+
+        // APU 全体制御
+        this.enabled = true;
+        this.muted = false;
+        this.masterVolume = 15;
+
+        // FM / PCM / PSG の各音源
+        this.fm = new FMUnit();
+        this.pcm = new PCMUnit(bus);
+        this.psg = new PSGUnit();
+
+        // ミックス比率
+        this.mixFM = 1.0;
+        this.mixPCM = 1.0;
+        this.mixPSG = 1.0;
+
+        // APU 状態
+        this.busy = false;
+
+        // WebAudio 出力
+        this.sampleRate = 44100;
+        this.bufferL = new Float32Array(1024);
+        this.bufferR = new Float32Array(1024);
+        this.bufferPos = 0;
+    }
+
+    // -----------------------------
+    // レジスタ読み書き
+    // -----------------------------
+    read(addr) {
+        switch (addr) {
+            case 0x032002: // APUSTAT
+                return this.busy ? 0x80 : 0x00;
+        }
+        return 0xFF;
+    }
+
+    write(addr, value) {
+        value &= 0xFF;
+
+        switch (addr) {
+            case 0x032000: // APUCTL
+                this.enabled = !!(value & 0x80);
+                this.muted = !!(value & 0x40);
+                this.masterVolume = value & 0x0F;
+                break;
+
+            case 0x032004: // APUMIX
+                this.mixFM  = ((value >> 4) & 0x03) / 3;
+                this.mixPCM = ((value >> 2) & 0x03) / 3;
+                this.mixPSG = (value & 0x03) / 3;
+                break;
+
+            // FM チャンネル 0
+            case 0x032010: this.fm.writeKey(0, value); break;
+            case 0x032012: this.fm.writeFreq(0, value); break;
+            case 0x032014: this.fm.writeAlg(0, value); break;
+
+            // FM チャンネル 1〜3（+0x18）
+            default:
+                if (addr >= 0x032040 && addr < 0x032080) {
+                    const ch = Math.floor((addr - 0x032040) / 0x18) + 1;
+                    const off = (addr - 0x032040) % 0x18;
+                    this.fm.write(ch, off, value);
+                }
+
+                // PCM チャンネル 0〜3（+0x8）
+                else if (addr >= 0x032080 && addr < 0x0320C0) {
+                    const ch = Math.floor((addr - 0x032080) / 8);
+                    const off = (addr - 0x032080) % 8;
+                    this.pcm.write(ch, off, value);
+                }
+
+                // PSG チャンネル 0〜3（+0x8）
+                else if (addr >= 0x0320C0 && addr < 0x032100) {
+                    const ch = Math.floor((addr - 0x0320C0) / 8);
+                    const off = (addr - 0x0320C0) % 8;
+                    this.psg.write(ch, off, value);
+                }
+        }
+    }
+
+    // -----------------------------
+    // APU ステップ（CPU サイクルに同期）
+    // -----------------------------
+    step() {
+        if (!this.enabled || this.muted) return;
+
+        // FM / PCM / PSG の内部更新
+        this.fm.step();
+        this.pcm.step();
+        this.psg.step();
+
+        // 44.1kHz でサンプル生成
+        this.generateSample();
+    }
+
+    // -----------------------------
+    // サンプル生成（ステレオ）
+    // -----------------------------
+    generateSample() {
+        const l = (
+            this.fm.outputL()  * this.mixFM +
+            this.pcm.outputL() * this.mixPCM +
+            this.psg.outputL() * this.mixPSG
+        ) * (this.masterVolume / 15);
+
+        const r = (
+            this.fm.outputR()  * this.mixFM +
+            this.pcm.outputR() * this.mixPCM +
+            this.psg.outputR() * this.mixPSG
+        ) * (this.masterVolume / 15);
+
+        this.bufferL[this.bufferPos] = l;
+        this.bufferR[this.bufferPos] = r;
+
+        this.bufferPos++;
+
+        if (this.bufferPos >= this.bufferL.length) {
+            this.flushAudio();
+            this.bufferPos = 0;
+        }
+    }
+
+    // -----------------------------
+    // WebAudio にバッファを送る
+    // -----------------------------
+    flushAudio() {
+        // 後で実装（AudioWorklet or ScriptProcessor）
+    }
+}
+class FMUnit {
+    constructor() {
+        this.channels = [
+            new FMChannel(),
+            new FMChannel(),
+            new FMChannel(),
+            new FMChannel()
+        ];
+    }
+
+    writeKey(ch, value) { this.channels[ch].writeKey(value); }
+    writeFreq(ch, value) { this.channels[ch].writeFreq(value); }
+    writeAlg(ch, value) { this.channels[ch].writeAlg(value); }
+
+    write(ch, off, value) {
+        this.channels[ch].write(off, value);
+    }
+
+    step() {
+        for (const ch of this.channels) ch.step();
+    }
+
+    outputL() {
+        return this.channels.reduce((a, c) => a + c.outputL(), 0);
+    }
+
+    outputR() {
+        return this.channels.reduce((a, c) => a + c.outputR(), 0);
+    }
+}
+class PCMUnit {
+    constructor(bus) {
+        this.bus = bus;
+        this.channels = [
+            new PCMChannel(bus),
+            new PCMChannel(bus),
+            new PCMChannel(bus),
+            new PCMChannel(bus)
+        ];
+    }
+
+    write(ch, off, value) {
+        this.channels[ch].write(off, value);
+    }
+
+    step() {
+        for (const ch of this.channels) ch.step();
+    }
+
+    outputL() {
+        return this.channels.reduce((a, c) => a + c.outputL(), 0);
+    }
+
+    outputR() {
+        return this.channels.reduce((a, c) => a + c.outputR(), 0);
+    }
+}
+class PSGUnit {
+    constructor() {
+        this.channels = [
+            new PSGSquare(),
+            new PSGSquare(),
+            new PSGSquare(),
+            new PSGNoise()
+        ];
+    }
+
+    write(ch, off, value) {
+        this.channels[ch].write(off, value);
+    }
+
+    step() {
+        for (const ch of this.channels) ch.step();
+    }
+
+    outputL() {
+        return this.channels.reduce((a, c) => a + c.outputL(), 0);
+    }
+
+    outputR() {
+        return this.channels.reduce((a, c) => a + c.outputR(), 0);
+    }
+}
+
 class Bus {
     constructor(romBanks) {
         // メモリ領域
@@ -291,6 +858,238 @@ class Bus {
     write16(addr, value) {
         this.write8(addr, value & 0xFF);
         this.write8(addr + 1, value >> 8);
+    }
+}
+class Controller {
+    constructor() {
+        this.state = 0xFFFF;   // 現在のボタン状態（1=離す, 0=押す）
+        this.latched = 0xFFFF; // ラッチされた16bit
+    }
+
+    // ボタン入力を更新（外部から呼ぶ）
+    setButtons(buttons) {
+        let v = 0xFFFF;
+
+        if (buttons.B)      v &= ~(1 << 15);
+        if (buttons.Y)      v &= ~(1 << 14);
+        if (buttons.SELECT) v &= ~(1 << 13);
+        if (buttons.START)  v &= ~(1 << 12);
+        if (buttons.UP)     v &= ~(1 << 11);
+        if (buttons.DOWN)   v &= ~(1 << 10);
+        if (buttons.LEFT)   v &= ~(1 << 9);
+        if (buttons.RIGHT)  v &= ~(1 << 8);
+        if (buttons.A)      v &= ~(1 << 7);
+        if (buttons.X)      v &= ~(1 << 6);
+        if (buttons.L)      v &= ~(1 << 5);
+        if (buttons.R)      v &= ~(1 << 4);
+
+        this.state = v;
+    }
+
+    // ラッチ（VBlank または手動）
+    latch() {
+        this.latched = this.state;
+    }
+
+    // 16bit 一括読み出し
+    read() {
+        return this.latched;
+    }
+}
+class IO {
+    constructor(bus) {
+        this.bus = bus;
+
+        this.joy1 = new Controller();
+        this.joy2 = new Controller();
+
+        this.hwVersion = 0x01; // 仮
+        this.isNTSC = true;
+
+        // タイマー
+        this.timer0 = 0;
+        this.timerRunning = false;
+        this.timerIRQ = false;
+
+        // IRQ 状態
+        this.irqAPU = false;
+        this.irqTimer = false;
+        this.irqExternal = false;
+    }
+
+    // -----------------------------
+    // 読み取り
+    // -----------------------------
+    read(addr) {
+        switch (addr) {
+            case 0x030000: return this.joy1.read() & 0xFF;
+            case 0x030001: return (this.joy1.read() >> 8) & 0xFF;
+
+            case 0x030002: return this.joy2.read() & 0xFF;
+            case 0x030003: return (this.joy2.read() >> 8) & 0xFF;
+
+            case 0x030008: // HWREG
+                return (this.isNTSC ? 0x80 : 0x00) | (this.hwVersion & 0x0F);
+
+            case 0x03000A: return this.timer0 & 0xFF;
+            case 0x03000B: return (this.timer0 >> 8) & 0xFF;
+            case 0x03000C: return (this.timer0 >> 16) & 0xFF;
+            case 0x03000D: return (this.timer0 >> 24) & 0xFF;
+
+            case 0x030010: // IRQSTAT
+                return (this.irqAPU ? 0x04 : 0) |
+                       (this.irqTimer ? 0x02 : 0) |
+                       (this.irqExternal ? 0x01 : 0);
+        }
+        return 0xFF;
+    }
+
+    // -----------------------------
+    // 書き込み
+    // -----------------------------
+    write(addr, value) {
+        value &= 0xFF;
+
+        switch (addr) {
+            case 0x030004: this.joy1.latch(); break;
+            case 0x030006: this.joy2.latch(); break;
+
+            case 0x03000A:
+                this.timer0 = (this.timer0 & 0xFFFFFF00) | value;
+                break;
+            case 0x03000B:
+                this.timer0 = (this.timer0 & 0xFFFF00FF) | (value << 8);
+                break;
+            case 0x03000C:
+                this.timer0 = (this.timer0 & 0xFF00FFFF) | (value << 16);
+                break;
+            case 0x03000D:
+                this.timer0 = (this.timer0 & 0x00FFFFFF) | (value << 24);
+                break;
+
+            case 0x03000E: // TIMERCTL
+                this.timerRunning = !!(value & 0x01);
+                this.timerIRQ = !!(value & 0x02);
+                break;
+
+            case 0x030012: // IRQCLR
+                if (value & 0x04) this.irqAPU = false;
+                if (value & 0x02) this.irqTimer = false;
+                if (value & 0x01) this.irqExternal = false;
+                break;
+
+            case 0x030014: // BANKSEL
+                this.bus.setBank(value);
+                break;
+
+            case 0x030016: // PORTEXP
+                // 拡張ポート（未実装）
+                break;
+        }
+    }
+
+    // -----------------------------
+    // タイマー更新（CPU サイクルごと）
+    // -----------------------------
+    step() {
+        if (this.timerRunning) {
+            this.timer0 = (this.timer0 + 1) >>> 0;
+
+            if (this.timerIRQ) {
+                this.irqTimer = true;
+            }
+        }
+    }
+}
+class DMA {
+    constructor(bus) {
+        this.bus = bus;
+
+        this.control = 0;   // DMACTL
+        this.src = 0;       // DMASRC (24bit)
+        this.dst = 0;       // DMADST (24bit)
+        this.count = 0;     // DMACNT (16bit)
+        this.active = false; // DMASTAT bit0
+    }
+
+    // -----------------------------
+    // レジスタ読み書き
+    // -----------------------------
+    read(addr) {
+        switch (addr) {
+            case 0x03300C: // DMASTAT
+                return this.active ? 1 : 0;
+        }
+        return 0xFF;
+    }
+
+    write(addr, value) {
+        value &= 0xFF;
+
+        switch (addr) {
+            case 0x033000: // DMACTL
+                this.control = value;
+                if (value & 0x80) this.startDMA();
+                break;
+
+            case 0x033002: // DMASRC low
+                this.src = (this.src & 0xFFFF00) | value;
+                break;
+            case 0x033003: // DMASRC mid
+                this.src = (this.src & 0xFF00FF) | (value << 8);
+                break;
+            case 0x033004: // DMASRC high
+                this.src = (this.src & 0x00FFFF) | (value << 16);
+                break;
+
+            case 0x033006: // DMADST low
+                this.dst = (this.dst & 0xFFFF00) | value;
+                break;
+            case 0x033007: // DMADST mid
+                this.dst = (this.dst & 0xFF00FF) | (value << 8);
+                break;
+            case 0x033008: // DMADST high
+                this.dst = (this.dst & 0x00FFFF) | (value << 16);
+                break;
+
+            case 0x03300A: // DMACNT low
+                this.count = (this.count & 0xFF00) | value;
+                break;
+            case 0x03300B: // DMACNT high
+                this.count = (this.count & 0x00FF) | (value << 8);
+                break;
+        }
+    }
+
+    // -----------------------------
+    // DMA 開始
+    // -----------------------------
+    startDMA() {
+        if (this.active) return;
+
+        this.active = true;
+
+        const direction = (this.control >> 6) & 1; // 0=RAM→VRAM, 1=VRAM→RAM
+        const type = this.control & 0x03;          // 転送タイプ（未使用）
+
+        // CPU を止めて即時転送
+        for (let i = 0; i < this.count; i++) {
+            const s = (this.src + i) & 0xFFFFFF;
+            const d = (this.dst + i) & 0xFFFFFF;
+
+            if (direction === 0) {
+                // RAM → VRAM
+                const v = this.bus.read8(s);
+                this.bus.write8(d, v);
+            } else {
+                // VRAM → RAM
+                const v = this.bus.read8(d);
+                this.bus.write8(s, v);
+            }
+        }
+
+        this.active = false;
+        this.control &= ~0x80; // 開始ビットクリア
     }
 }
 
