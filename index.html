@@ -1,0 +1,374 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>OMU</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      @font-face {
+  font-family: "Renner";
+  src: url("./Renner.ttf") format("truetype");
+  font-display: swap;
+ 
+}
+      :root{color-scheme: light dark; }
+      body {
+        background: rgb(0,0,0);
+        font-family: "Renner";
+        margin: 0; padding: 0;
+      }
+      h1 { font-weight: 300; font-size: 25px; }
+      header {
+        display: flex; gap: 12px; align-items: center; margin-bottom: 12px;
+      }
+      canvas {
+        height: 100%;
+        aspect-ratio: 160 / 144;
+        image-rendering: pixelated;
+        border: 1px solid #000000;
+        background: #000;
+      }
+      .row {
+        padding-top: 0px; height: 83vh;
+        justify-content: center; display: flex;
+        gap: 12px; align-items: center;
+      }
+      .mono { font-size: 20px; }
+      small { opacity: 0.7; }
+      button {
+        font-family: sans-serif; padding: 10px;
+        background: rgb(0,0,0); color: rgb(255,255,255);
+        border: 1px solid rgb(255,255,255); cursor: pointer;
+      }
+      .file-input { display: none; }
+      .file-label {
+        display: inline-block; padding: 10px 16px;
+        background: #000000; color: white;
+        border: 1px solid white; border-radius: 0px;
+        cursor: pointer; font-size: 14px; transition: background 0.2s;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>OM-16</h1>
+      <label class="file-label">
+        Select
+        <input id="rom" type="file" class="file-input" />
+      </label>
+      <span id="file-name"></span>
+      <button id="fullscreenBtn">Fullscreen</button>
+      <button id="start">Start</button>
+      <div class="mono" id="status">Waiting...</div>
+      <div>
+        <span class="mono">CPU PC:</span>
+        <span id="pc" class="mono">0x0000</span>
+      </div>
+    </header>
+    <div class="row">
+      <canvas id="screen" width="256" height="240"></canvas>
+      <div style="display:none">
+        <div><b>FPS:</b> <span id="fps">0</span></div>
+        <div><b>Cycles:</b> <span id="cyc" class="mono">0</span></div>
+      </div>
+    </div>
+
+    <script>
+      class CPU {
+    constructor(bus) {
+        this.bus = bus; // メモリ/PPU/APU へアクセスするバス
+
+        // 汎用レジスタ R0〜R7
+        this.R = new Uint16Array(8);
+
+        // 特殊レジスタ
+        this.PC = 0x060000; // IPL開始
+        this.SP = 0x1FFFF;  // WRAM上のスタック
+        this.SR = 0x00;     // フラグ
+        this.BR = 0x00;     // バンクレジスタ
+        this.DP = 0x0000;   // ダイレクトページ
+
+        // サイクルカウンタ（後でPPU/APUと同期）
+        this.cycles = 0;
+    }
+
+    // -----------------------------
+    // メモリアクセス
+    // -----------------------------
+    read8(addr) {
+        return this.bus.read8(addr);
+    }
+
+    read16(addr) {
+        const lo = this.bus.read8(addr);
+        const hi = this.bus.read8((addr + 1) & 0xFFFFFF);
+        return (hi << 8) | lo;
+    }
+
+    write8(addr, value) {
+        this.bus.write8(addr, value & 0xFF);
+    }
+
+    write16(addr, value) {
+        this.bus.write8(addr, value & 0xFF);
+        this.bus.write8((addr + 1) & 0xFFFFFF, value >> 8);
+    }
+
+    // -----------------------------
+    // 命令フェッチ（可変長）
+    // -----------------------------
+    fetch() {
+        const op = this.read8(this.PC);
+        this.PC = (this.PC + 1) & 0xFFFFFF;
+
+        const size = this.opcodeLength(op);
+        const bytes = [op];
+
+        for (let i = 1; i < size; i++) {
+            bytes.push(this.read8(this.PC));
+            this.PC = (this.PC + 1) & 0xFFFFFF;
+        }
+
+        return bytes;
+    }
+
+    // 命令長テーブル（仮）
+    opcodeLength(op) {
+        // ここは後で 68命令の正式テーブルに置き換える
+        if (op === 0x00) return 1; // NOP
+        if (op === 0x10) return 2; // LDA #imm8
+        if (op === 0x11) return 3; // LDA #imm16
+        if (op === 0x30) return 3; // JMP abs
+        if (op === 0x31) return 4; // JMP long
+        return 1;
+    }
+
+    // -----------------------------
+    // デコード & 実行
+    // -----------------------------
+    step() {
+        const bytes = this.fetch();
+        const op = bytes[0];
+
+        switch (op) {
+            case 0x00: // NOP
+                this.cycles += 2;
+                break;
+
+            case 0x10: // LDA #imm8 → R0
+                this.R[0] = bytes[1];
+                this.updateNZ(this.R[0]);
+                this.cycles += 2;
+                break;
+
+            case 0x11: // LDA #imm16 → R0
+                this.R[0] = (bytes[2] << 8) | bytes[1];
+                this.updateNZ(this.R[0]);
+                this.cycles += 3;
+                break;
+
+            case 0x30: { // JMP abs
+                const addr = (bytes[2] << 8) | bytes[1];
+                this.PC = addr;
+                this.cycles += 3;
+                break;
+            }
+
+            case 0x31: { // JMP long
+                const addr = (bytes[3] << 16) | (bytes[2] << 8) | bytes[1];
+                this.PC = addr;
+                this.cycles += 4;
+                break;
+            }
+
+            default:
+                console.warn("Unknown opcode:", op.toString(16));
+                break;
+        }
+    }
+
+    // -----------------------------
+    // フラグ更新
+    // -----------------------------
+    updateNZ(value) {
+        if (value === 0) this.SR |= 0x02; // Z
+        else this.SR &= ~0x02;
+
+        if (value & 0x8000) this.SR |= 0x80; // N
+        else this.SR &= ~0x80;
+    }
+}
+class Bus {
+    constructor(romBanks) {
+        // メモリ領域
+        this.wram  = new Uint8Array(0x20000);  // 128KB
+        this.sram  = new Uint8Array(0x8000);   // 32KB
+        this.vram  = new Uint8Array(0x10000);  // 64KB
+        this.oam   = new Uint8Array(0x400);    // 1KB
+        this.cgram = new Uint8Array(0x200);    // 512B
+        this.ipl   = new Uint8Array(0x10000);  // 64KB (Bank0固定ROM)
+
+        // ROMバンク（32KB × 256）
+        this.rom = romBanks; // romBanks[bank][offset]
+
+        // デバイス
+        this.ppu = null;
+        this.apu = null;
+        this.dma = null;
+        this.io  = null;
+
+        // CPU が書き換えるバンクレジスタ
+        this.bankRegister = 0;
+    }
+
+    // CPU からバンク番号を設定
+    setBank(bank) {
+        this.bankRegister = bank & 0xFF;
+    }
+
+    // -----------------------------
+    // 8bit 読み取り
+    // -----------------------------
+    read8(addr) {
+        addr &= 0xFFFFFF;
+
+        if (addr < 0x020000) return this.wram[addr];
+        if (addr < 0x028000) return this.sram[addr - 0x020000];
+        if (addr < 0x030000) return 0xFF; // 予約領域
+
+        if (addr < 0x030020) return this.io?.read(addr) ?? 0xFF;
+        if (addr < 0x031100) return this.ppu?.read(addr) ?? 0xFF;
+        if (addr < 0x032100) return this.apu?.read(addr) ?? 0xFF;
+        if (addr < 0x033010) return this.dma?.read(addr) ?? 0xFF;
+
+        if (addr < 0x040000) return 0xFF; // 予約領域
+        if (addr < 0x050000) return this.vram[addr - 0x040000];
+        if (addr < 0x050400) return this.oam[addr - 0x050000];
+        if (addr < 0x050600) return this.cgram[addr - 0x050400];
+
+        if (addr < 0x060000) return 0xFF;
+        if (addr < 0x070000) return this.ipl[addr - 0x060000];
+
+        // ROMバンク領域
+        const bank = this.bankRegister;
+        const offset = addr - 0x070000;
+        return this.rom[bank][offset] ?? 0xFF;
+    }
+
+    // -----------------------------
+    // 8bit 書き込み
+    // -----------------------------
+    write8(addr, value) {
+        addr &= 0xFFFFFF;
+        value &= 0xFF;
+
+        if (addr < 0x020000) { this.wram[addr] = value; return; }
+        if (addr < 0x028000) { this.sram[addr - 0x020000] = value; return; }
+        if (addr < 0x030000) return;
+
+        if (addr < 0x030020) { this.io?.write(addr, value); return; }
+        if (addr < 0x031100) { this.ppu?.write(addr, value); return; }
+        if (addr < 0x032100) { this.apu?.write(addr, value); return; }
+        if (addr < 0x033010) { this.dma?.write(addr, value); return; }
+
+        if (addr < 0x040000) return;
+        if (addr < 0x050000) { this.vram[addr - 0x040000] = value; return; }
+        if (addr < 0x050400) { this.oam[addr - 0x050000] = value; return; }
+        if (addr < 0x050600) { this.cgram[addr - 0x050400] = value; return; }
+
+        // ROM/予約領域は書き込み不可
+    }
+
+    // -----------------------------
+    // 16bit 読み書き（CPU用）
+    // -----------------------------
+    read16(addr) {
+        const lo = this.read8(addr);
+        const hi = this.read8(addr + 1);
+        return (hi << 8) | lo;
+    }
+
+    write16(addr, value) {
+        this.write8(addr, value & 0xFF);
+        this.write8(addr + 1, value >> 8);
+    }
+}
+
+    class Emulator {
+    constructor(romBanks) {
+        // Bus（メモリマップ + デバイス）
+        this.bus = new Bus(romBanks);
+
+        // CPU（OM-C1）
+        this.cpu = new CPU(this.bus);
+
+        // PPU / APU / DMA / IO を後で接続
+        this.bus.ppu = new PPU(this.bus);
+        this.bus.apu = new APU(this.bus);
+        this.bus.dma = new DMA(this.bus);
+        this.bus.io  = new IO(this.bus);
+
+        // 画面
+        this.canvas = document.getElementById('screen');
+        this.ctx = this.canvas.getContext('2d');
+
+        // 1フレームあたりのCPUサイクル（仮）
+        this.cyclesPerFrame = 100000; // 16MHz / 60fps ≒ 266k → とりあえず少なめ
+    }
+
+    // ROMをロード（32KB × 256バンク）
+    loadROM(buffer) {
+        const bankSize = 0x8000; // 32KB
+        const romBanks = [];
+
+        for (let i = 0; i < buffer.length; i += bankSize) {
+            romBanks.push(buffer.slice(i, i + bankSize));
+        }
+
+        // Bus に再設定
+        this.bus.rom = romBanks;
+
+        console.log(`ROM Loaded: ${romBanks.length} banks`);
+    }
+
+    // 1フレーム実行
+    frame() {
+        let cycles = 0;
+
+        while (cycles < this.cyclesPerFrame) {
+            const before = this.cpu.cycles;
+            this.cpu.step();
+            cycles += (this.cpu.cycles - before);
+
+            // PPU/APU のステップ
+            this.bus.ppu.step();
+            this.bus.apu.step();
+        }
+
+        // 画面更新
+        this.bus.ppu.render(this.ctx);
+    }
+
+    // メインループ
+    run() {
+        const loop = () => {
+            this.frame();
+            requestAnimationFrame(loop);
+        };
+        requestAnimationFrame(loop);
+    }
+}
+
+
+// 初期化とROM読み込みの紐付け
+const emu = new Emulator();
+document.getElementById('rom').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    const buffer = await file.arrayBuffer();
+    emu.loadROM(new Uint8Array(buffer));
+    emu.run();
+});
+
+    </script>
+  </body>
+</html>
